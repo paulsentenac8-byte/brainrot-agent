@@ -18,7 +18,9 @@ log = logging.getLogger("brainrot")
 
 # ─── CONFIG (depuis variables d'environnement Railway) ─────────────────────────
 GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
-YOUTUBE_TOKEN   = os.environ["YOUTUBE_ACCESS_TOKEN"]
+YOUTUBE_CLIENT_ID = os.environ["YOUTUBE_CLIENT_ID"]
+YOUTUBE_SECRET    = os.environ["YOUTUBE_SECRET"]
+YOUTUBE_REFRESH   = os.environ["YOUTUBE_REFRESH"]
 RESEND_API_KEY  = os.environ["RESEND_API_KEY"]
 NOTIFY_EMAIL    = os.environ.get("NOTIFY_EMAIL", "paulsentenac8@gmail.com")
 INTERVAL_HOURS  = float(os.environ.get("INTERVAL_HOURS", "2"))
