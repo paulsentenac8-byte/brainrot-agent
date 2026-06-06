@@ -388,15 +388,68 @@ def run_pipeline():
         if r.returncode == 0:
             normed.append(out)
 
-    # 5. Fusionner
-    with open("/tmp/concat.txt","w") as f:
-        f.writelines([f"file '{p}'\n" for p in normed])
+    # 5. Ajouter transitions entre clips
+    TRANSITIONS = ["fade", "fadeblack", "circleclose", "slideright", "slideleft", "wipeleft", "wiperight"]
+    transitioned = []
+    clip_duration = 8  # secondes par clip
+    transition_duration = 0.5  # secondes de transition
 
-    merged = "/tmp/merged.mp4"
+    if len(normed) >= 2:
+        log.info("  Ajout des transitions...")
+        # Construire le filtre xfade pour enchaîner tous les clips
+        filter_parts = []
+        inputs = ""
+        for i, p in enumerate(normed):
+            inputs += f"-i {p} "
+
+        # Construire la commande xfade complexe
+        n_clips = len(normed)
+        filter_complex = ""
+        last_label = "[0:v]"
+        last_audio = "[0:a]"
+
+        for i in range(1, n_clips):
+            transition = random.choice(TRANSITIONS)
+            offset = (clip_duration - transition_duration) * i
+            new_v_label = f"[v{i}]"
+            new_a_label = f"[a{i}]"
+
+            filter_complex += f"{last_label}[{i}:v]xfade=transition={transition}:duration={transition_duration}:offset={offset}{new_v_label};"
+            filter_complex += f"{last_audio}[{i}:a]acrossfade=d={transition_duration}{new_a_label};"
+            last_label = new_v_label
+            last_audio = new_a_label
+
+        filter_complex = filter_complex.rstrip(";")
+        output_label = last_label + last_audio
+
+        merged_transition = "/tmp/merged_transition.mp4"
+        cmd_parts = ["ffmpeg", "-y"]
+        for p in normed:
+            cmd_parts += ["-i", p]
+        cmd_parts += [
+            "-filter_complex", filter_complex,
+            "-map", last_label,
+            "-map", last_audio,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+            "-c:a", "aac", merged_transition
+        ]
+        r_trans = subprocess.run(cmd_parts, capture_output=True, timeout=120)
+        if r_trans.returncode == 0:
+            log.info("  Transitions ajoutées ✅")
+            merged = merged_transition
+        else:
+            log.warning("  Transitions échouées, fallback concat simple")
+            with open("/tmp/concat.txt","w") as f:
+                f.writelines([f"file '{p}'\n" for p in normed])
+            merged = "/tmp/merged.mp4"
+            subprocess.run(["ffmpeg","-y","-f","concat","-safe","0","-i","/tmp/concat.txt","-c","copy",merged], capture_output=True, timeout=60)
+    else:
+        with open("/tmp/concat.txt","w") as f:
+            f.writelines([f"file '{p}'\n" for p in normed])
+        merged = "/tmp/merged.mp4"
+        subprocess.run(["ffmpeg","-y","-f","concat","-safe","0","-i","/tmp/concat.txt","-c","copy",merged], capture_output=True, timeout=60)
+
     final  = "/tmp/final.mp4"
-
-    # Fusion
-    subprocess.run(["ffmpeg","-y","-f","concat","-safe","0","-i","/tmp/concat.txt","-c","copy",merged], capture_output=True, timeout=60)
 
     # Ajout voix off si disponible
     if has_voice and os.path.exists(voiceover_path):
