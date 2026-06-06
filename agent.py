@@ -264,6 +264,65 @@ def generate_thumbnail(title, theme_title, output_path, n):
         log.error(f"Thumbnail error: {e}")
         return False
 
+# ─── GOOGLE TRENDS ─────────────────────────────────────────────────────────────
+def get_trending_topic():
+    try:
+        import re
+        r = requests.get(
+            "https://trends.google.com/trends/trendingsearches/daily/rss?geo=FR",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if r.status_code == 200:
+            titles = re.findall(r'<title><!\[CDATA\[([^\]]+)\]\]></title>', r.text)
+            topics = [t for t in titles if len(t) > 3 and "Google" not in t]
+            if topics:
+                topic = random.choice(topics[:5])
+                log.info(f"Trending topic: {topic}")
+                return topic
+    except Exception as e:
+        log.warning(f"Trends error: {e}")
+    return None
+
+def adapt_theme_to_trend(theme, trend_topic):
+    if not trend_topic:
+        return theme
+    try:
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+            json={"contents":[{"parts":[{"text": f"Trending topic France: '{trend_topic}'. Thème vidéo: '{theme['title']}'. Génère UN titre court qui mélange les deux pour enfants. Max 50 caractères, français, emojis. UNIQUEMENT le titre."}]}]},
+            timeout=15)
+        if r.status_code == 200:
+            new_title = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            theme = dict(theme)
+            theme["title"] = new_title
+            log.info(f"Titre adapté trend: {new_title}")
+            return theme
+    except Exception as e:
+        log.warning(f"Trend adapt error: {e}")
+    return theme
+
+# ─── MULTI-LANGUE ──────────────────────────────────────────────────────────────
+def translate_to_english(french_title):
+    try:
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+            json={"contents":[{"parts":[{"text": f"Traduis en anglais ce titre YouTube, garde emojis et style accrocheur: '{french_title}'. UNIQUEMENT la traduction."}]}]},
+            timeout=15)
+        if r.status_code == 200:
+            en = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            log.info(f"Titre EN: {en}")
+            return en
+    except Exception as e:
+        log.warning(f"Translation error: {e}")
+    return None
+
+# ─── CHAPITRES YOUTUBE ─────────────────────────────────────────────────────────
+def generate_chapters(nb_clips, clip_duration=8):
+    chapters = "\n\n📚 CHAPITRES:\n00:00 Introduction\n"
+    for i in range(nb_clips):
+        ts = (i+1) * clip_duration
+        chapters += f"{ts//60:02d}:{ts%60:02d} Partie {i+2}\n"
+    return chapters
+
 # ─── TITRE SEO VIA GEMINI TEXT ─────────────────────────────────────────────────
 def generate_seo_title(theme_title, n):
     """Génère un titre YouTube optimisé SEO avec Gemini Text"""
@@ -481,51 +540,66 @@ def run_pipeline():
     thumb_path = f"/tmp/thumbnail_{n}.jpg"
     generate_thumbnail(theme["title"], theme["title"], thumb_path, n)
 
-    # 7. Titre SEO
-    title = generate_seo_title(theme["title"], n)
+    # 7. Titre SEO + traduction anglais
+    title_fr = generate_seo_title(theme["title"], n)
+    title_en = translate_to_english(title_fr)
+    title = title_fr  # On utilise le français pour YouTube FR
 
-    # 8. Description
+    # 8. Chapitres automatiques
+    chapters = generate_chapters(len(normed))
+
+    # 9. Description complète avec chapitres
+    trend_line = f"🔥 Trending aujourd'hui: {trend}\n" if trend else ""
     desc = f"""✨ {theme['title']} ✨
 
-Une histoire complète en animation IA !
+{trend_line}Une histoire complète en animation IA !
 🎬 Nouvelle vidéo chaque jour — Abonne-toi pour ne rien rater !
 
-📖 Synopsis: {theme['voice_intro']}
+📖 {theme['voice_intro']}
+{chapters}
+#shorts #animation #kids #viral #histoire #cartoon #youtube #trending #ia #animationIA #enfants"""
 
-#shorts #animation #kids #viral #histoire #cartoon #youtube #trending #ia #animationIA"""
+    # Version anglaise de la description
+    if title_en:
+        log.info(f"Titre EN disponible: {title_en}")
 
-    tags = theme["tags"] + ["shorts","animation","viral","histoire","cartoon","kids","youtube","ia"]
+    tags = theme["tags"] + ["shorts","animation","viral","histoire","cartoon","kids","youtube","ia","enfants","trending"]
 
-    # 9. YouTube upload
+    # 10. YouTube upload FR
     yt_url = None
     try:
         token = get_youtube_token()
         vid_id = youtube_upload(final, title, desc, tags, token, thumb_path)
         yt_url = f"https://www.youtube.com/shorts/{vid_id}"
-        log.info(f"YouTube ✅ {yt_url}")
+        log.info(f"YouTube FR ✅ {yt_url}")
     except Exception as e:
         log.error(f"YouTube: {e}")
 
-    # 10. Email
+    # 11. Email
+    trend_badge = f'<span style="background:#FF6B00;color:#fff;padding:3px 8px;border-radius:4px;font-size:12px">🔥 Trending: {trend}</span><br><br>' if trend else ""
     yt_btn = f'<a href="{yt_url}" style="display:inline-block;background:#FF0000;color:#fff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600">▶️ Voir sur YouTube</a>' if yt_url else "<p>❌ YouTube upload échoué</p>"
     send_email(
         f"🎬 Vidéo #{n} — {theme['title']} publiée !",
         f"""<div style='font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px'>
           <h2>🎬 {theme['title']} #{n}</h2>
           <div style='background:#f5f5f5;border-radius:10px;padding:16px;margin:16px 0'>
+            {trend_badge}
             <p>📅 {date_str} UTC</p>
-            <p>📝 {title}</p>
+            <p>📝 FR: {title}</p>
+            <p>📝 EN: {title_en or 'N/A'}</p>
             <p>⏱ {dur}s · 📦 {size_mb:.1f}MB · 📐 9:16</p>
             <p>🎙️ Voix off: {'✅' if has_voice else '❌'}</p>
             <p>🖼️ Thumbnail: ✅</p>
+            <p>🔀 Transitions: ✅</p>
+            <p>📚 Chapitres: ✅</p>
           </div>
           {yt_btn}
-          <p style='color:#999;font-size:12px;margin-top:16px'>1 vidéo/jour · Animal_Lab · Powered by Veo 3 + ElevenLabs</p>
+          <p style='color:#999;font-size:12px;margin-top:16px'>1 vidéo/jour · Animal_Lab · Veo 3 + ElevenLabs + Google Trends</p>
         </div>"""
     )
 
     # Cleanup
-    subprocess.run(["rm","-rf","/tmp/clips","/tmp/norm",merged,voiceover_path if has_voice else ""])
+    subprocess.run(["rm","-rf","/tmp/clips","/tmp/norm","/tmp/merged_transition.mp4","/tmp/merged.mp4"])
     log.info(f"=== Pipeline #{n} terminé ===\n")
     return yt_url
 
