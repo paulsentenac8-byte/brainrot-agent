@@ -315,6 +315,73 @@ def translate_to_english(french_title):
         log.warning(f"Translation error: {e}")
     return None
 
+# ─── YOUTUBE ANALYTICS ─────────────────────────────────────────────────────────
+def get_youtube_analytics():
+    """Récupère les stats des 7 derniers jours et retourne le thème le plus performant"""
+    try:
+        token = get_youtube_token()
+        end_date = datetime.utcnow().strftime("%Y-%m-%d")
+        start_date = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        # Récupérer les stats globales de la chaîne
+        r = requests.get(
+            "https://youtubeanalytics.googleapis.com/v2/reports",
+            headers={"Authorization": f"Bearer {token}"},
+            params={
+                "ids": "channel==MINE",
+                "startDate": start_date,
+                "endDate": end_date,
+                "metrics": "views,likes,comments,averageViewDuration,subscribersGained",
+                "dimensions": "video",
+                "sort": "-views",
+                "maxResults": 10
+            },
+            timeout=15
+        )
+
+        if r.status_code != 200:
+            log.warning(f"Analytics error: {r.status_code}")
+            return None
+
+        data = r.json()
+        rows = data.get("rows", [])
+        if not rows:
+            log.info("Pas encore de données analytics (chaîne trop récente)")
+            return None
+
+        # Analyser les vidéos les plus vues
+        total_views = sum(row[1] for row in rows)
+        total_likes = sum(row[2] for row in rows)
+        avg_duration = sum(row[4] for row in rows) / len(rows) if rows else 0
+
+        log.info(f"📊 Analytics 7 jours: {total_views} vues, {total_likes} likes, {avg_duration:.0f}s durée moyenne")
+
+        # Générer un rapport avec Gemini pour adapter la stratégie
+        if total_views > 0:
+            report_prompt = f"""Tu es un expert YouTube. Voici les stats de la chaîne Animal_Lab sur 7 jours:
+- Vues totales: {total_views}
+- Likes: {total_likes}
+- Durée moyenne de visionnage: {avg_duration:.0f}s
+- Nombre de vidéos: {len(rows)}
+
+Donne 2-3 conseils très courts (1 ligne chacun) pour améliorer les prochaines vidéos. Sois direct et concret."""
+
+            r2 = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+                json={"contents":[{"parts":[{"text": report_prompt}]}]},
+                timeout=15
+            )
+            if r2.status_code == 200:
+                advice = r2.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                log.info(f"💡 Conseils IA: {advice}")
+                return {"views": total_views, "likes": total_likes, "avg_duration": avg_duration, "advice": advice}
+
+        return {"views": total_views, "likes": total_likes, "avg_duration": avg_duration, "advice": None}
+
+    except Exception as e:
+        log.warning(f"Analytics exception: {e}")
+        return None
+
 # ─── CHAPITRES YOUTUBE ─────────────────────────────────────────────────────────
 def generate_chapters(nb_clips, clip_duration=8):
     chapters = "\n\n📚 CHAPITRES:\n00:00 Introduction\n"
@@ -387,6 +454,66 @@ def send_email(subject, html):
     except Exception as e:
         log.warning(f"Email error: {e}")
 
+# ─── PRE-CHECKS ────────────────────────────────────────────────────────────────
+def check_all_systems():
+    """Vérifie que tout fonctionne AVANT de consommer le quota Veo 3"""
+    log.info("🔍 Vérification des systèmes...")
+    errors = []
+
+    # 1. Vérifier FFmpeg
+    r = subprocess.run(["ffmpeg", "-version"], capture_output=True)
+    if r.returncode != 0:
+        errors.append("❌ FFmpeg non disponible")
+    else:
+        log.info("  ✅ FFmpeg OK")
+
+    # 2. Vérifier YouTube token
+    try:
+        token = get_youtube_token()
+        if not token or len(token) < 10:
+            errors.append("❌ YouTube token invalide")
+        else:
+            # Test rapide de l'API YouTube
+            test_r = requests.get(
+                "https://www.googleapis.com/youtube/v3/channels?part=id&mine=true",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10
+            )
+            if test_r.status_code == 200:
+                log.info("  ✅ YouTube token OK")
+            else:
+                errors.append(f"❌ YouTube API erreur: {test_r.status_code}")
+    except Exception as e:
+        errors.append(f"❌ YouTube token erreur: {e}")
+
+    # 3. Vérifier Gemini quota (test léger sans générer de vidéo)
+    try:
+        test_r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+            json={"contents":[{"parts":[{"text": "test"}]}]},
+            timeout=10
+        )
+        if test_r.status_code == 200:
+            log.info("  ✅ Gemini API OK")
+        elif test_r.status_code == 429:
+            errors.append("❌ Gemini quota épuisé — retry dans 1h")
+        else:
+            errors.append(f"❌ Gemini API erreur: {test_r.status_code}")
+    except Exception as e:
+        errors.append(f"❌ Gemini erreur: {e}")
+
+    # 4. Vérifier espace disque
+    disk = subprocess.run(["df", "-h", "/tmp"], capture_output=True, text=True)
+    log.info(f"  💾 Disque: {disk.stdout.split()[-4] if disk.stdout else 'N/A'} disponible")
+
+    if errors:
+        for err in errors:
+            log.error(f"  {err}")
+        return False, errors
+
+    log.info("✅ Tous les systèmes sont opérationnels !")
+    return True, []
+
 # ─── PIPELINE PRINCIPAL ─────────────────────────────────────────────────────────
 def run_pipeline():
     n = inc_count()
@@ -394,12 +521,39 @@ def run_pipeline():
     date_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
     log.info(f"\n=== PIPELINE #{n} — {theme['title']} — {date_str} UTC ===")
 
+    # 🔍 PRE-CHECKS — vérifier tout AVANT de consommer le quota Veo 3
+    ok, errors = check_all_systems()
+    if not ok:
+        log.error(f"Pipeline annulé — systèmes non opérationnels: {errors}")
+        # Si c'est un problème de quota Gemini, on réessaie dans 1h
+        if any("quota" in e for e in errors):
+            log.info("⏳ Retry dans 1h pour le quota...")
+            time.sleep(3600)
+            ok2, errors2 = check_all_systems()
+            if not ok2:
+                log.error("Toujours pas opérationnel après 1h, abandon jusqu'au prochain run")
+                return None
+        else:
+            return None
+
+    # Adapter au trending topic
+    trend = get_trending_topic()
+    if trend:
+        theme = adapt_theme_to_trend(theme, trend)
+
+    # 📊 Récupérer les analytics (chaque 7 jours)
+    analytics = None
+    if n % 7 == 0 or n == 1:  # Premier run + toutes les 7 vidéos
+        analytics = get_youtube_analytics()
+        if analytics and analytics.get("advice"):
+            log.info(f"📊 Stats: {analytics['views']} vues | Conseil: {analytics['advice'][:100]}")
+
     os.makedirs("/tmp/clips", exist_ok=True)
     os.makedirs("/tmp/norm", exist_ok=True)
 
-    # 1. Générer voix off intro
+    # 1. Générer voix off intro (désactivé — plan gratuit insuffisant)
+    has_voice = False
     voiceover_path = f"/tmp/voiceover_{n}.mp3"
-    has_voice = generate_voiceover(theme["voice_intro"], voiceover_path)
 
     # 2. Lancer clips Veo 3
     ops = []
@@ -575,8 +729,16 @@ def run_pipeline():
     except Exception as e:
         log.error(f"YouTube: {e}")
 
-    # 11. Email
+    # 11. Email avec analytics
     trend_badge = f'<span style="background:#FF6B00;color:#fff;padding:3px 8px;border-radius:4px;font-size:12px">🔥 Trending: {trend}</span><br><br>' if trend else ""
+    analytics_section = ""
+    if analytics:
+        analytics_section = f"""
+        <div style='background:#e8f5e9;border-radius:8px;padding:12px;margin:12px 0'>
+          <p><b>📊 Stats 7 derniers jours</b></p>
+          <p>👁️ {analytics['views']} vues · ❤️ {analytics['likes']} likes · ⏱️ {analytics.get('avg_duration',0):.0f}s durée moy.</p>
+          {f"<p>💡 <i>{analytics['advice']}</i></p>" if analytics.get('advice') else ""}
+        </div>"""
     yt_btn = f'<a href="{yt_url}" style="display:inline-block;background:#FF0000;color:#fff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600">▶️ Voir sur YouTube</a>' if yt_url else "<p>❌ YouTube upload échoué</p>"
     send_email(
         f"🎬 Vidéo #{n} — {theme['title']} publiée !",
@@ -594,6 +756,7 @@ def run_pipeline():
             <p>📚 Chapitres: ✅</p>
           </div>
           {yt_btn}
+          {analytics_section}
           <p style='color:#999;font-size:12px;margin-top:16px'>1 vidéo/jour · Animal_Lab · Veo 3 + ElevenLabs + Google Trends</p>
         </div>"""
     )
