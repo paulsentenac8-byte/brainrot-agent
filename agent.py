@@ -766,11 +766,171 @@ def run_pipeline():
     log.info(f"=== Pipeline #{n} terminé ===\n")
     return yt_url
 
+# ─── COMPILATION HEBDOMADAIRE ──────────────────────────────────────────────────
+CLIPS_ARCHIVE = "/tmp/weekly_clips.json"
+
+def save_video_to_archive(yt_url, title, local_path):
+    """Sauvegarde chaque vidéo générée pour la compilation hebdomadaire"""
+    try:
+        archive = []
+        if os.path.exists(CLIPS_ARCHIVE):
+            with open(CLIPS_ARCHIVE) as f:
+                archive = json.load(f)
+        archive.append({
+            "url": yt_url,
+            "title": title,
+            "path": local_path,
+            "date": datetime.utcnow().strftime("%Y-%m-%d")
+        })
+        # Garder seulement les 7 dernières
+        archive = archive[-7:]
+        with open(CLIPS_ARCHIVE, "w") as f:
+            json.dump(archive, f)
+        log.info(f"Vidéo archivée ({len(archive)}/7)")
+    except Exception as e:
+        log.warning(f"Archive error: {e}")
+
+def make_weekly_compilation():
+    """Assemble les 7 derniers shorts en une vidéo longue et uploade sur YouTube"""
+    log.info("\n=== COMPILATION HEBDOMADAIRE ===")
+    try:
+        if not os.path.exists(CLIPS_ARCHIVE):
+            log.warning("Pas encore assez de vidéos pour la compilation")
+            return
+
+        with open(CLIPS_ARCHIVE) as f:
+            archive = json.load(f)
+
+        if len(archive) < 3:
+            log.warning(f"Seulement {len(archive)} vidéos — minimum 3 pour compiler")
+            return
+
+        # Télécharger les vidéos depuis catbox si les fichiers locaux n'existent plus
+        local_files = []
+        for i, entry in enumerate(archive):
+            path = f"/tmp/weekly_clip_{i}.mp4"
+            if entry.get("path") and os.path.exists(entry["path"]):
+                local_files.append(entry["path"])
+            elif entry.get("url") and entry["url"].startswith("http"):
+                try:
+                    urllib.request.urlretrieve(entry["url"], path)
+                    local_files.append(path)
+                    log.info(f"  Clip {i+1} téléchargé depuis URL")
+                except Exception as e:
+                    log.warning(f"  Clip {i+1} non disponible: {e}")
+
+        if len(local_files) < 2:
+            log.error("Pas assez de fichiers locaux pour compiler")
+            return
+
+        # Créer une intro texte avec FFmpeg
+        intro = "/tmp/weekly_intro.mp4"
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", "color=c=black:size=720x1280:duration=3:rate=30",
+            "-vf", "drawtext=text='🎬 BEST OF LA SEMAINE':fontcolor=white:fontsize=50:x=(w-text_w)/2:y=(h-text_h)/2:borderw=3:bordercolor=black",
+            "-c:v", "libx264", "-preset", "fast", intro
+        ], capture_output=True, timeout=30)
+
+        # Assembler tous les clips
+        all_files = ([intro] if os.path.exists(intro) else []) + local_files
+        with open("/tmp/weekly_concat.txt", "w") as f:
+            for p in all_files:
+                f.write(f"file '{p}'\n")
+
+        compilation = "/tmp/weekly_compilation.mp4"
+        r = subprocess.run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", "/tmp/weekly_concat.txt",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-movflags", "+faststart", compilation
+        ], capture_output=True, timeout=180)
+
+        if r.returncode != 0:
+            log.error("Compilation échouée")
+            return
+
+        size_mb = os.path.getsize(compilation)/1024/1024
+        dur = sum([8*NB_CLIPS for _ in local_files])
+        log.info(f"Compilation: {size_mb:.1f}MB, ~{dur}s")
+
+        # Thumbnail spéciale compilation
+        thumb_path = "/tmp/weekly_thumb.jpg"
+        generate_thumbnail("BEST OF LA SEMAINE 🔥", "Meilleurs moments", thumb_path, "W")
+
+        # Titre et description
+        date_str = datetime.utcnow().strftime("%d/%m/%Y")
+        titles_list = "\n".join([f"• {e['title']}" for e in archive[-7:]])
+        title = f"🔥 BEST OF Animal_Lab — Compilation semaine du {date_str}"
+        desc = f"""🎬 COMPILATION HEBDOMADAIRE — Les meilleures vidéos de la semaine !
+
+Au programme cette semaine :
+{titles_list}
+
+✨ Abonne-toi pour une nouvelle vidéo CHAQUE JOUR !
+
+#compilation #bestof #animation #kids #viral #youtube #shorts #animationIA #enfants #semaine"""
+        tags = ["compilation","bestof","animation","kids","viral","youtube","enfants","semaine","animationIA"]
+
+        # Upload YouTube (vidéo normale, pas short)
+        try:
+            token = get_youtube_token()
+            size = os.path.getsize(compilation)
+            meta = {
+                "snippet": {"title": title, "description": desc, "tags": tags, "categoryId": "1"},
+                "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False}
+            }
+            init_r = requests.post(
+                "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
+                headers={"Authorization":f"Bearer {token}","Content-Type":"application/json",
+                         "X-Upload-Content-Type":"video/mp4","X-Upload-Content-Length":str(size)},
+                json=meta, timeout=30)
+            upload_url = init_r.headers.get("Location","")
+            with open(compilation,"rb") as f:
+                up_r = requests.put(upload_url,
+                    headers={"Content-Type":"video/mp4","Content-Length":str(size)},
+                    data=f, timeout=600)
+            if up_r.status_code in (200,201):
+                vid_id = up_r.json().get("id","")
+                yt_url = f"https://www.youtube.com/watch?v={vid_id}"
+                log.info(f"Compilation YouTube ✅ {yt_url}")
+
+                # Upload thumbnail
+                if os.path.exists(thumb_path):
+                    with open(thumb_path,"rb") as f:
+                        requests.post(
+                            f"https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId={vid_id}",
+                            headers={"Authorization":f"Bearer {token}","Content-Type":"image/jpeg"},
+                            data=f, timeout=60)
+
+                # Email notification
+                send_email(
+                    f"🔥 Compilation hebdomadaire publiée !",
+                    f"""<div style='font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px'>
+                      <h2>🎬 Best Of Animal_Lab — Semaine du {date_str}</h2>
+                      <div style='background:#f5f5f5;border-radius:10px;padding:16px;margin:16px 0'>
+                        <p>📹 {len(local_files)} vidéos compilées</p>
+                        <p>⏱ ~{dur}s · 📦 {size_mb:.1f}MB</p>
+                      </div>
+                      <a href="{yt_url}" style="display:inline-block;background:#FF0000;color:#fff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600">▶️ Voir la compilation</a>
+                    </div>"""
+                )
+        except Exception as e:
+            log.error(f"Upload compilation: {e}")
+
+        # Cleanup
+        subprocess.run(["rm","-f",compilation,intro,"/tmp/weekly_concat.txt"])
+        log.info("=== Compilation terminée ===\n")
+
+    except Exception as e:
+        log.error(f"Compilation error: {e}")
+
 # ─── SCHEDULER ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info(f"🤖 Brainrot Agent v4 démarré")
     log.info(f"⏰ Intervalle: {INTERVAL_HOURS}h | Clips: {NB_CLIPS} | Email: {NOTIFY_EMAIL}")
     log.info(f"🎙️ ElevenLabs: {'✅' if ELEVENLABS_KEY else '❌'}")
+    log.info(f"📅 Compilation hebdomadaire: ✅ chaque dimanche")
 
     # Installer Pillow si pas présent
     subprocess.run(["pip","install","Pillow","--quiet","--break-system-packages"], capture_output=True)
@@ -781,11 +941,22 @@ if __name__ == "__main__":
     except Exception as e:
         log.error(f"Premier run erreur: {e}")
 
+    # Compteur de jours pour la compilation hebdomadaire
+    video_count_since_compilation = 0
+
     # Boucle infinie
     while True:
         log.info(f"💤 Pause {INTERVAL_HOURS}h...")
         time.sleep(INTERVAL_HOURS * 3600)
         try:
-            run_pipeline()
+            url = run_pipeline()
+            video_count_since_compilation += 1
+
+            # Compilation tous les 7 jours (7 vidéos)
+            if video_count_since_compilation >= 7:
+                log.info("📅 7 vidéos générées — lancement compilation hebdomadaire !")
+                make_weekly_compilation()
+                video_count_since_compilation = 0
+
         except Exception as e:
             log.error(f"Pipeline erreur: {e}")
